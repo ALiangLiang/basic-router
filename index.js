@@ -13,11 +13,11 @@
  */
 
 var debug = require('debug')('router')
+var qs = require('querystring')
 var flatten = require('array-flatten')
 var Layer = require('./lib/layer')
-var methods = require('methods')
 var mixin = require('utils-merge')
-var parseUrl = require('parseurl')
+var parseUrl = require('url').parse
 var Route = require('./lib/route')
 var setPrototypeOf = require('setprototypeof')
 
@@ -29,9 +29,11 @@ var setPrototypeOf = require('setprototypeof')
 var slice = Array.prototype.slice
 
 /* istanbul ignore next */
-var defer = typeof setImmediate === 'function'
-  ? setImmediate
-  : function(fn){ process.nextTick(fn.bind.apply(fn, arguments)) }
+var defer = typeof setImmediate === 'function' ?
+  setImmediate :
+  function(fn) {
+    process.nextTick(fn.bind.apply(fn, arguments))
+  }
 
 /**
  * Expose `Router`.
@@ -60,8 +62,8 @@ function Router(options) {
 
   var opts = options || {}
 
-  function router(req, res, next) {
-    router.handle(req, res, next)
+  function router(session, res, next) {
+    router.handle(session, res, next)
   }
 
   // inherit from the correct prototype
@@ -81,7 +83,7 @@ function Router(options) {
  */
 
 /* istanbul ignore next */
-Router.prototype = function () {}
+Router.prototype = function() {}
 
 /**
  * Map the given param placeholder `name`(s) to the given callback.
@@ -99,14 +101,14 @@ Router.prototype = function () {}
  * Just like in middleware, you must either respond to the request or call next
  * to avoid stalling the request.
  *
- *  router.param('user_id', function(req, res, next, id){
+ *  router.param('user_id', function(session, res, next, id){
  *    User.find(id, function(err, user){
  *      if (err) {
  *        return next(err)
  *      } else if (!user) {
  *        return next(new Error('failed to load user'))
  *      }
- *      req.user = user
+ *      session.user = user
  *      next()
  *    })
  *  })
@@ -145,21 +147,19 @@ Router.prototype.param = function param(name, fn) {
 }
 
 /**
- * Dispatch a req, res into the router.
+ * Dispatch a session, res into the router.
  *
  * @private
  */
 
-Router.prototype.handle = function handle(req, res, callback) {
+Router.prototype.handle = function handle(session, res, callback) {
   if (!callback) {
     throw new TypeError('argument callback is required')
   }
 
-  debug('dispatching %s %s', req.method, req.url)
+  debug('dispatching %s %s', session.method, session.url)
 
   var idx = 0
-  var methods
-  var protohost = getProtohost(req.url) || ''
   var removed = ''
   var self = this
   var slashAdded = false
@@ -167,42 +167,38 @@ Router.prototype.handle = function handle(req, res, callback) {
 
   // middleware and routes
   var stack = this.stack
+  console.log(stack)
 
   // manage inter-router variables
-  var parentParams = req.params
-  var parentUrl = req.baseUrl || ''
-  var done = restore(callback, req, 'baseUrl', 'next', 'params')
+  var parentParams = session.params
+  var parentUrl = session.baseUrl || ''
+  var done = restore(callback, session, 'baseUrl', 'next', 'params')
 
   // setup next layer
-  req.next = next
+  session.next = next
 
-  // for options requests, respond with a default if nothing else responds
-  if (req.method === 'OPTIONS') {
-    methods = []
-    done = wrap(done, generateOptionsResponder(res, methods))
-  }
-
-  // setup basic req values
-  req.baseUrl = parentUrl
-  req.originalUrl = req.originalUrl || req.url
+  // setup basic session values
+  session.baseUrl = parentUrl
+  session.originalUrl = session.originalUrl || session.url
+  session.query = qs.parse(parseUrl(session.url).query)
 
   next()
 
   function next(err) {
-    var layerError = err === 'route'
-      ? null
-      : err
+    var layerError = err === 'route' ?
+      null :
+      err
 
     // remove added slash
     if (slashAdded) {
-      req.url = req.url.substr(1)
+      session.url = session.url.substr(1)
       slashAdded = false
     }
 
-    // restore altered req.url
+    // restore altered session.url
     if (removed.length !== 0) {
-      req.baseUrl = parentUrl
-      req.url = protohost + removed + req.url.substr(protohost.length)
+      session.baseUrl = parentUrl
+      session.url = removed + session.url.substr(0)
       removed = ''
     }
 
@@ -219,7 +215,7 @@ Router.prototype.handle = function handle(req, res, callback) {
     }
 
     // get pathname of request
-    var path = getPathname(req)
+    var path = getPathname(session)
 
     if (path == null) {
       return done(layerError)
@@ -234,6 +230,12 @@ Router.prototype.handle = function handle(req, res, callback) {
       layer = stack[idx++]
       match = matchLayer(layer, path)
       route = layer.route
+
+      console.log(idx)
+
+      if (idx < session.step) {
+        continue
+      }
 
       if (typeof match !== 'boolean') {
         // hold on to layerError
@@ -254,21 +256,9 @@ Router.prototype.handle = function handle(req, res, callback) {
         match = false
         continue
       }
-
-      var method = req.method;
-      var has_method = route._handles_method(method)
-
-      // build up automatic options response
-      if (!has_method && method === 'OPTIONS' && methods) {
-        methods.push.apply(methods, route._methods())
-      }
-
-      // don't even bother matching route
-      if (!has_method && method !== 'HEAD') {
-        match = false
-        continue
-      }
     }
+
+    session.step = idx
 
     // no match
     if (match !== true) {
@@ -277,23 +267,23 @@ Router.prototype.handle = function handle(req, res, callback) {
 
     // store route for dispatch on change
     if (route) {
-      req.route = route
+      session.route = route
     }
 
     // Capture one-time layer values
-    req.params = self.mergeParams
-      ? mergeParams(layer.params, parentParams)
-      : layer.params
+    session.params = self.mergeParams ?
+      mergeParams(layer.params, parentParams) :
+      layer.params
     var layerPath = layer.path
 
     // this should be done for the layer
-    self.process_params(layer, paramcalled, req, res, function (err) {
+    self.process_params(layer, paramcalled, session, res, function(err) {
       if (err) {
         return next(layerError || err)
       }
 
       if (route) {
-        return layer.handle_request(req, res, next)
+        return layer.handle_request(session, res, next)
       }
 
       trim_prefix(layer, layerError, layerPath, path)
@@ -311,28 +301,28 @@ Router.prototype.handle = function handle(req, res, callback) {
 
       // Trim off the part of the url that matches the route
       // middleware (.use stuff) needs to have the path stripped
-      debug('trim prefix (%s) from url %s', layerPath, req.url)
+      debug('trim prefix (%s) from url %s', layerPath, session.url)
       removed = layerPath
-      req.url = protohost + req.url.substr(protohost.length + removed.length)
+      session.url = session.url.substr(removed.length)
 
       // Ensure leading slash
-      if (!protohost && req.url[0] !== '/') {
-        req.url = '/' + req.url
+      if (session.url[0] !== '/') {
+        session.url = '/' + session.url
         slashAdded = true
       }
 
       // Setup base URL (no trailing slash)
-      req.baseUrl = parentUrl + (removed[removed.length - 1] === '/'
-        ? removed.substring(0, removed.length - 1)
-        : removed)
+      session.baseUrl = parentUrl + (removed[removed.length - 1] === '/' ?
+        removed.substring(0, removed.length - 1) :
+        removed)
     }
 
-    debug('%s %s : %s', layer.name, layerPath, req.originalUrl)
+    debug('%s %s : %s', layer.name, layerPath, session.originalUrl)
 
     if (layerError) {
-      layer.handle_error(layerError, req, res, next)
+      layer.handle_error(layerError, session, res, next)
     } else {
-      layer.handle_request(req, res, next)
+      layer.handle_request(session, res, next)
     }
   }
 }
@@ -343,7 +333,7 @@ Router.prototype.handle = function handle(req, res, callback) {
  * @private
  */
 
-Router.prototype.process_params = function process_params(layer, called, req, res, done) {
+Router.prototype.process_params = function process_params(layer, called, session, res, done) {
   var params = this.params
 
   // captured parameters from the layer, keys and values
@@ -369,14 +359,14 @@ Router.prototype.process_params = function process_params(layer, called, req, re
       return done(err)
     }
 
-    if (i >= keys.length ) {
+    if (i >= keys.length) {
       return done()
     }
 
     paramIndex = 0
     key = keys[i++]
     name = key.name
-    paramVal = req.params[name]
+    paramVal = session.params[name]
     paramCallbacks = params[name]
     paramCalled = called[name]
 
@@ -385,10 +375,10 @@ Router.prototype.process_params = function process_params(layer, called, req, re
     }
 
     // param previously called with same value or error occurred
-    if (paramCalled && (paramCalled.match === paramVal
-      || (paramCalled.error && paramCalled.error !== 'route'))) {
+    if (paramCalled && (paramCalled.match === paramVal ||
+        (paramCalled.error && paramCalled.error !== 'route'))) {
       // restore value
-      req.params[name] = paramCalled.value
+      session.params[name] = paramCalled.value
 
       // next param
       return param(paramCalled.error)
@@ -408,7 +398,7 @@ Router.prototype.process_params = function process_params(layer, called, req, re
     var fn = paramCallbacks[paramIndex++]
 
     // store updated value
-    paramCalled.value = req.params[key.name]
+    paramCalled.value = session.params[key.name]
 
     if (err) {
       // store error
@@ -420,7 +410,7 @@ Router.prototype.process_params = function process_params(layer, called, req, re
     if (!fn) return param()
 
     try {
-      fn(req, res, paramCallback, paramVal, key.name)
+      fn(session, res, paramCallback, paramVal, key.name)
     } catch (e) {
       paramCallback(e)
     }
@@ -516,8 +506,8 @@ Router.prototype.route = function route(path) {
     end: true
   }, handle)
 
-  function handle(req, res, next) {
-    route.dispatch(req, res, next)
+  function handle(session, res, next) {
+    route.dispatch(session, res, next)
   }
 
   layer.route = route
@@ -527,68 +517,25 @@ Router.prototype.route = function route(path) {
 }
 
 // create Router#VERB functions
-methods.concat('all').forEach(function(method){
-  Router.prototype[method] = function (path) {
-    var route = this.route(path)
-    route[method].apply(route, slice.call(arguments, 1))
-    return this
-  }
-})
-
-/**
- * Generate a callback that will make an OPTIONS response.
- *
- * @param {OutgoingMessage} res
- * @param {array} methods
- * @private
- */
-
-function generateOptionsResponder(res, methods) {
-  return function onDone(fn, err) {
-    if (err || methods.length === 0) {
-      return fn(err)
-    }
-
-    trySendOptionsResponse(res, methods, fn)
-  }
+Router.prototype.dialog = function dialog(path) {
+  var route = this.route(path)
+  route.dialog.apply(route, slice.call(arguments, 1))
+  return this
 }
 
 /**
  * Get pathname of request.
  *
- * @param {IncomingMessage} req
+ * @param {IncomingMessage} session
  * @private
  */
 
-function getPathname(req) {
+function getPathname(session) {
   try {
-    return parseUrl(req).pathname;
+    return parseUrl(session.url).pathname;
   } catch (err) {
     return undefined;
   }
-}
-
-/**
- * Get get protocol + host for a URL.
- *
- * @param {string} url
- * @private
- */
-
-function getProtohost(url) {
-  if (typeof url !== 'string' || url.length === 0 || url[0] === '/') {
-    return undefined
-  }
-
-  var searchIndex = url.indexOf('?')
-  var pathLength = searchIndex !== -1
-    ? searchIndex
-    : url.length
-  var fqdnIndex = url.substr(0, pathLength).indexOf('://')
-
-  return fqdnIndex !== -1
-    ? url.substr(0, url.indexOf('/', 3 + fqdnIndex))
-    : undefined
 }
 
 /**
@@ -667,70 +614,12 @@ function restore(fn, obj) {
     vals[i] = obj[props[i]]
   }
 
-  return function(){
+  return function() {
     // restore vals
     for (var i = 0; i < props.length; i++) {
       obj[props[i]] = vals[i]
     }
 
     return fn.apply(this, arguments)
-  }
-}
-
-/**
- * Send an OPTIONS response.
- *
- * @private
- */
-
-function sendOptionsResponse(res, methods) {
-  var options = Object.create(null)
-
-  // build unique method map
-  for (var i = 0; i < methods.length; i++) {
-    options[methods[i]] = true
-  }
-
-  // construct the allow list
-  var allow = Object.keys(options).sort().join(', ')
-
-  // send response
-  res.setHeader('Allow', allow)
-  res.setHeader('Content-Length', Buffer.byteLength(allow))
-  res.setHeader('Content-Type', 'text/plain')
-  res.setHeader('X-Content-Type-Options', 'nosniff')
-  res.end(allow)
-}
-
-/**
- * Try to send an OPTIONS response.
- *
- * @private
- */
-
-function trySendOptionsResponse(res, methods, next) {
-  try {
-    sendOptionsResponse(res, methods)
-  } catch (err) {
-    next(err)
-  }
-}
-
-/**
- * Wrap a function
- *
- * @private
- */
-
-function wrap(old, fn) {
-  return function proxy() {
-    var args = new Array(arguments.length + 1)
-
-    args[0] = old
-    for (var i = 0, len = arguments.length; i < len; i++) {
-      args[i + 1] = arguments[i]
-    }
-
-    fn.apply(this, args)
   }
 }
